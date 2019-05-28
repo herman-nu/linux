@@ -55,9 +55,10 @@ void *module_alloc(unsigned long size)
 		 * less likely that the module region gets exhausted, so we
 		 * can simply omit this fallback in that case.
 		 */
-		p = __vmalloc_node_range(size, MODULE_ALIGN, VMALLOC_START,
-				VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
-				NUMA_NO_NODE, __builtin_return_address(0));
+		p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+				module_alloc_base + SZ_2G, GFP_KERNEL,
+				PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+				__builtin_return_address(0));
 
 	if (p && (kasan_module_alloc(p, size) < 0)) {
 		vfree(p);
@@ -95,15 +96,27 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
 {
 	s64 sval = do_reloc(op, place, val);
 
+	/*
+	 * The ELF psABI for AArch64 documents the 16-bit and 32-bit place
+	 * relative relocations as having a range of [-2^15, 2^16) or
+	 * [-2^31, 2^32), respectively. However, in order to be able to detect
+	 * overflows reliably, we have to choose whether we interpret such
+	 * quantities as signed or as unsigned, and stick with it.
+	 * The way we organize our address space requires a signed
+	 * interpretation of 32-bit relative references, so let's use that
+	 * for all R_AARCH64_PRELxx relocations. This means our upper
+	 * bound for overflow detection should be Sxx_MAX rather than Uxx_MAX.
+	 */
+
 	switch (len) {
 	case 16:
 		*(s16 *)place = sval;
-		if (sval < S16_MIN || sval > U16_MAX)
+		if (sval < S16_MIN || sval > S16_MAX)
 			return -ERANGE;
 		break;
 	case 32:
 		*(s32 *)place = sval;
-		if (sval < S32_MIN || sval > U32_MAX)
+		if (sval < S32_MIN || sval > S32_MAX)
 			return -ERANGE;
 		break;
 	case 64:
@@ -194,6 +207,33 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, __le32 *place, u64 val,
 	if ((u64)(sval + 1) >= 2)
 		return -ERANGE;
 
+	return 0;
+}
+
+static int reloc_insn_adrp(struct module *mod, Elf64_Shdr *sechdrs,
+			   __le32 *place, u64 val)
+{
+	u32 insn;
+
+	if (!is_forbidden_offset_for_adrp(place))
+		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
+				      AARCH64_INSN_IMM_ADR);
+
+	/* patch ADRP to ADR if it is in range */
+	if (!reloc_insn_imm(RELOC_OP_PREL, place, val & ~0xfff, 0, 21,
+			    AARCH64_INSN_IMM_ADR)) {
+		insn = le32_to_cpu(*place);
+		insn &= ~BIT(31);
+	} else {
+		/* out of range for ADR -> emit a veneer */
+		val = module_emit_veneer_for_adrp(mod, sechdrs, place, val & ~0xfff);
+		if (!val)
+			return -ENOEXEC;
+		insn = aarch64_insn_gen_branch_imm((u64)place, val,
+						   AARCH64_INSN_BRANCH_NOLINK);
+	}
+
+	*place = cpu_to_le32(insn);
 	return 0;
 }
 
@@ -336,14 +376,13 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
 					     AARCH64_INSN_IMM_ADR);
 			break;
-#ifndef CONFIG_ARM64_ERRATUM_843419
 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
 			overflow_check = false;
 		case R_AARCH64_ADR_PREL_PG_HI21:
-			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
-					     AARCH64_INSN_IMM_ADR);
+			ovf = reloc_insn_adrp(me, sechdrs, loc, val);
+			if (ovf && ovf != -ERANGE)
+				return ovf;
 			break;
-#endif
 		case R_AARCH64_ADD_ABS_LO12_NC:
 		case R_AARCH64_LDST8_ABS_LO12_NC:
 			overflow_check = false;
@@ -385,7 +424,9 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 
 			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
 			    ovf == -ERANGE) {
-				val = module_emit_plt_entry(me, loc, &rel[i], sym);
+				val = module_emit_plt_entry(me, sechdrs, loc, &rel[i], sym);
+				if (!val)
+					return -ENOEXEC;
 				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
 						     26, AARCH64_INSN_IMM_26);
 			}
@@ -418,9 +459,8 @@ int module_finalize(const Elf_Ehdr *hdr,
 	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
 
 	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
-		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0) {
-			apply_alternatives((void *)s->sh_addr, s->sh_size);
-		}
+		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0)
+			apply_alternatives_module((void *)s->sh_addr, s->sh_size);
 #ifdef CONFIG_ARM64_MODULE_PLTS
 		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
 		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
